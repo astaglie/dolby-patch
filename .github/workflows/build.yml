@@ -1,0 +1,38 @@
+name: patch-dolby
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Unduh apktool 2.11.1
+        run: |
+          curl -fL -o apktool.jar https://bitbucket.org/iBotPeaches/apktool/downloads/apktool_2.11.1.jar \
+          || curl -fL -o apktool.jar https://github.com/iBotPeaches/Apktool/releases/download/v2.11.1/apktool_2.11.1.jar
+          ls -l apktool.jar
+      - name: Bongkar kode saja (resource tidak disentuh)
+        run: java -jar apktool.jar d -r -api 33 -f DolbyAtmos_base.apk -o out
+      - name: Patch EFFECT_TYPE_NULL
+        run: |
+          grep -rl "AudioEffect;->EFFECT_TYPE_NULL" out | tee patched.txt
+          test -s patched.txt || { echo "Tidak ada referensi EFFECT_TYPE_NULL"; exit 1; }
+          xargs -a patched.txt -r perl -0pi -e 's/sget-object (\S+), Landroid\/media\/audiofx\/AudioEffect;->EFFECT_TYPE_NULL:Ljava\/util\/UUID;/const-string $1, "ec7178ec-e5e1-4432-a3f4-4657e6795210"\n    invoke-static\/range {$1 .. $1}, Ljava\/util\/UUID;->fromString(Ljava\/lang\/String;)Ljava\/util\/UUID;\n    move-result-object $1/g'
+          if grep -r "AudioEffect;->EFFECT_TYPE_NULL" out; then echo "MASIH ADA, patch gagal"; exit 1; fi
+      - name: Build ulang
+        run: java -jar apktool.jar b -api 33 out -o unsigned.apk
+      - name: Align dan sign
+        run: |
+          BT=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -1)
+          echo "build-tools: $BT"
+          $BT/zipalign -p -f 4 unsigned.apk aligned.apk
+          keytool -genkeypair -keystore ks.jks -storepass dolbypass -keypass dolbypass -alias k -keyalg RSA -keysize 2048 -validity 36500 -dname "CN=Dolby"
+          $BT/apksigner sign --ks ks.jks --ks-pass pass:dolbypass --key-pass pass:dolbypass --min-sdk-version 30 --out DolbyAtmos_final.apk aligned.apk
+          $BT/apksigner verify -v DolbyAtmos_final.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DolbyAtmos_final
+          path: DolbyAtmos_final.apk
