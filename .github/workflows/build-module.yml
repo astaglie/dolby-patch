@@ -1,0 +1,74 @@
+name: build-module
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Unduh apktool 2.11.1
+        run: |
+          curl -fL -o apktool.jar https://bitbucket.org/iBotPeaches/apktool/downloads/apktool_2.11.1.jar \
+          || curl -fL -o apktool.jar https://github.com/iBotPeaches/Apktool/releases/download/v2.11.1/apktool_2.11.1.jar
+      - name: Patch UI Ginkgo (EFFECT_TYPE_NULL)
+        run: |
+          java -jar apktool.jar d -r -api 33 -f DolbyAtmos_base.apk -o out
+          grep -rl "AudioEffect;->EFFECT_TYPE_NULL" out | tee patched.txt
+          test -s patched.txt || { echo "Tidak ada referensi EFFECT_TYPE_NULL"; exit 1; }
+          xargs -a patched.txt -r perl -0pi -e 's/sget-object (\S+), Landroid\/media\/audiofx\/AudioEffect;->EFFECT_TYPE_NULL:Ljava\/util\/UUID;/const-string $1, "ec7178ec-e5e1-4432-a3f4-4657e6795210"\n    invoke-static\/range {$1 .. $1}, Ljava\/util\/UUID;->fromString(Ljava\/lang\/String;)Ljava\/util\/UUID;\n    move-result-object $1/g'
+          if grep -r "AudioEffect;->EFFECT_TYPE_NULL" out; then echo "MASIH ADA, patch gagal"; exit 1; fi
+          java -jar apktool.jar b -api 33 out -o unsigned.apk
+      - name: Align dan sign
+        run: |
+          BT=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -1)
+          $BT/zipalign -p -f 4 unsigned.apk aligned.apk
+          keytool -genkeypair -keystore ks.jks -storepass dolbypass -keypass dolbypass -alias k -keyalg RSA -keysize 2048 -validity 36500 -dname "CN=Dolby"
+          $BT/apksigner sign --ks ks.jks --ks-pass pass:dolbypass --key-pass pass:dolbypass --min-sdk-version 30 --out DolbyAtmos_final.apk aligned.apk
+          $BT/apksigner verify -v DolbyAtmos_final.apk
+      - name: Ambil modul mesin (reiryuki)
+        run: git clone --depth 1 https://github.com/reiryuki/Dolby-Atmos-OnePlus-9-Pro-Magisk-Module.git mod
+      - name: Rakit modul
+        run: |
+          cd mod
+          rm -rf .git .github
+          mkdir -p ginkgo
+          cp ../DolbyAtmos_final.apk ginkgo/DolbyAtmos.apk
+          cat > ginkgo.sh <<'EOF'
+          #!/system/bin/sh
+          MODDIR=${0%/*}
+          APK=$MODDIR/ginkgo/DolbyAtmos.apk
+          LOG=/data/local/tmp/ginkgo_ui.log
+          until [ "$(getprop sys.boot_completed)" = "1" ]; do sleep 3; done
+          sleep 15
+          [ -f "$APK" ] || exit 0
+          MARK=/data/local/tmp/.ginkgo_ui_ver
+          VER=$(stat -c %Y "$APK" 2>/dev/null)
+          if ! pm list packages | grep -q "package:com.dolby.atmos$" || [ "$(cat $MARK 2>/dev/null)" != "$VER" ]; then
+            cp "$APK" /data/local/tmp/ginkgo_ui.apk
+            chmod 644 /data/local/tmp/ginkgo_ui.apk
+            echo "== $(date) pasang UI Ginkgo" > $LOG
+            pm install -r -d -g /data/local/tmp/ginkgo_ui.apk >> $LOG 2>&1 || {
+              pm uninstall com.dolby.atmos >> $LOG 2>&1
+              pm install -d -g /data/local/tmp/ginkgo_ui.apk >> $LOG 2>&1
+            }
+            echo "$VER" > $MARK
+            rm -f /data/local/tmp/ginkgo_ui.apk
+          fi
+          EOF
+          sed -i 's/^          //' ginkgo.sh
+          printf '%s\n' '(sh "${0%/*}/ginkgo.sh" &)' > s.new
+          cat service.sh >> s.new
+          mv s.new service.sh
+          sed -i 's@^# debug$@grep -q "^dolby.mod=" "$OPTIONALS" || echo "dolby.mod=0" >> "$OPTIONALS"\n\n# debug@' customize.sh
+          grep -q 'dolby.mod=0' customize.sh || { echo "patch customize.sh gagal"; exit 1; }
+          grep -q 'ginkgo.sh' service.sh || { echo "patch service.sh gagal"; exit 1; }
+          sed -i 's|^name=.*|name=Dolby Atmos (mesin reiryuki + UI Ginkgo)|' module.prop
+          sh -n ginkgo.sh
+          zip -qr9 ../Dolby_Ginkgo_Module.zip .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Dolby_Ginkgo_Module
+          path: Dolby_Ginkgo_Module.zip
